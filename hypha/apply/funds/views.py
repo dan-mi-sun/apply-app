@@ -14,6 +14,7 @@ from django.utils.decorators import method_decorator
 from django.utils.safestring import mark_safe
 from django.utils.translation import ugettext_lazy as _
 from django.views import View
+from django.views.decorators.cache import cache_page
 from django.views.generic import (
     CreateView,
     DeleteView,
@@ -1103,6 +1104,7 @@ class SubmissionDetailPDFView(SingleObjectMixin, View):
         )
 
 
+@method_decorator(cache_page(60), name='dispatch')
 @method_decorator(staff_required, name='dispatch')
 class SubmissionResultView(FilterView):
     template_name = 'funds/submissions_result.html'
@@ -1124,7 +1126,11 @@ class SubmissionResultView(FilterView):
         return new_kwargs
 
     def get_queryset(self):
-        return self.filterset_class._meta.model.objects.current()
+        # For rounds we want all submissions but otherwise only current.
+        if self.request.GET.get('round'):
+            return self.filterset_class._meta.model.objects.all()
+        else:
+            return self.filterset_class._meta.model.objects.current()
 
     def get_context_data(self, **kwargs):
         search_term = self.request.GET.get('query')
@@ -1144,16 +1150,32 @@ class SubmissionResultView(FilterView):
         )
 
     def get_submission_values(self):
+        import re
         values = []
+        total = 0
+        average = 0
         for submission in self.object_list:
             try:
-                value = int(submission.data('value'))
-            except (TypeError, ValueError):
+                value = submission.data('value')
+            except KeyError:
                 value = 0
             else:
-                if not value or value < 0:
+                value = str(value)
+                value = re.sub(r'[.,]\d{2}$', '', value)
+                value = value.replace('USD', '')
+                value = value.replace('$', '')
+                value = value.replace('-', '')
+                value = value.replace(',', '')
+                value = value.replace('.', '')
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
                     value = 0
             finally:
                 values.append(value)
 
-        return {'total': sum(values), 'average': round(mean(values))}
+        if values:
+            total = sum(values)
+            average = round(mean(values))
+
+        return {'total': total, 'average': average}
