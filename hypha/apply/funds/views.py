@@ -1,7 +1,7 @@
 from copy import copy
 from datetime import timedelta
-from statistics import mean
 
+import django_tables2 as tables
 from django.contrib import messages
 from django.contrib.auth import get_user_model
 from django.contrib.auth.decorators import login_required, permission_required
@@ -72,8 +72,10 @@ from .forms import (
 from .models import (
     ApplicationRevision,
     ApplicationSubmission,
+    AssignedReviewers,
     LabBase,
     Reminder,
+    ReviewerRole,
     RoundBase,
     RoundsAndLabs,
 )
@@ -86,6 +88,7 @@ from .tables import (
     ReviewerSubmissionsTable,
     RoundsFilter,
     RoundsTable,
+    StaffAssignmentsTable,
     SubmissionFilterAndSearch,
     SubmissionReviewerFilterAndSearch,
     SummarySubmissionsTable,
@@ -94,8 +97,42 @@ from .workflow import (
     INITIAL_STATE,
     PHASES_MAPPING,
     STAGE_CHANGE_ACTIONS,
+    active_statuses,
     review_statuses,
 )
+
+User = get_user_model()
+
+
+class SubmissionStatsMixin:
+    def get_context_data(self, **kwargs):
+        submissions = ApplicationSubmission.objects.all()
+        submission_undetermined_count = submissions.undetermined().count()
+        review_my_count = submissions.reviewed_by(self.request.user).count()
+
+        submission_value = submissions.current().value()
+        submission_sum = intcomma(submission_value.get('value__sum'))
+        submission_count = submission_value.get('value__count')
+
+        submission_accepted_value = submissions.current_accepted().value()
+        submission_accepted_sum = intcomma(submission_accepted_value.get('value__sum'))
+        submission_accepted_count = submission_accepted_value.get('value__count')
+
+        reviews = Review.objects.all()
+        review_count = reviews.count()
+        review_my_score = reviews.by_user(self.request.user).score()
+
+        return super().get_context_data(
+            submission_undetermined_count=submission_undetermined_count,
+            review_my_count=review_my_count,
+            submission_sum=submission_sum,
+            submission_count=submission_count,
+            submission_accepted_count=submission_accepted_count,
+            submission_accepted_sum=submission_accepted_sum,
+            review_count=review_count,
+            review_my_score=review_my_score,
+            **kwargs,
+        )
 
 
 class UpdateReviewersMixin:
@@ -1113,7 +1150,7 @@ class SubmissionDetailPDFView(SingleObjectMixin, View):
 
 @method_decorator(cache_page(60), name='dispatch')
 @method_decorator(staff_required, name='dispatch')
-class SubmissionResultView(FilterView):
+class SubmissionResultView(SubmissionStatsMixin, FilterView):
     template_name = 'funds/submissions_result.html'
     filterset_class = SubmissionFilterAndSearch
     filter_action = ''
@@ -1133,59 +1170,23 @@ class SubmissionResultView(FilterView):
         return new_kwargs
 
     def get_queryset(self):
-        # For rounds we want all submissions but otherwise only current.
-        if self.request.GET.get('round'):
-            return self.filterset_class._meta.model.objects.all()
-        else:
-            return self.filterset_class._meta.model.objects.current()
+        return self.filterset_class._meta.model.objects.current()
 
     def get_context_data(self, **kwargs):
         search_term = self.request.GET.get('query')
-        total_value = '____'
-        average_value = '____'
-        if self.request.GET:
-            submission_values = self.get_submission_values()
-            total_value = intcomma(submission_values.get('total'))
-            average_value = intcomma(submission_values.get('average'))
+        submission_values = self.object_list.value()
+        count_values = submission_values.get('value__count')
+        total_value = intcomma(submission_values.get('value__sum'))
+        average_value = intcomma(round(submission_values.get('value__avg')))
 
         return super().get_context_data(
             search_term=search_term,
             filter_action=self.filter_action,
+            count_values=count_values,
             total_value=total_value,
             average_value=average_value,
             **kwargs,
         )
-
-    def get_submission_values(self):
-        import re
-        values = []
-        total = 0
-        average = 0
-        for submission in self.object_list:
-            try:
-                value = submission.data('value')
-            except KeyError:
-                value = 0
-            else:
-                value = str(value)
-                value = re.sub(r'[.,]\d{2}$', '', value)
-                value = value.replace('USD', '')
-                value = value.replace('$', '')
-                value = value.replace('-', '')
-                value = value.replace(',', '')
-                value = value.replace('.', '')
-                try:
-                    value = int(value)
-                except (TypeError, ValueError):
-                    value = 0
-            finally:
-                values.append(value)
-
-        if values:
-            total = sum(values)
-            average = round(mean(values))
-
-        return {'total': total, 'average': average}
 
 
 @method_decorator(staff_required, name='dispatch')
@@ -1230,9 +1231,46 @@ class ReviewerLeaderboardDetail(SingleTableMixin, ListView):
     template_name = 'funds/reviewer_leaderboard_detail.html'
 
     def get_context_data(self, **kwargs):
-        User = get_user_model()
         obj = User.objects.get(pk=self.kwargs.get('pk'))
         return super().get_context_data(object=obj, **kwargs)
 
     def get_table_data(self):
         return super().get_table_data().filter(author__reviewer_id=self.kwargs.get('pk')).select_related('submission')
+
+
+class RoleColumn(tables.Column):
+    def render(self, value, record):
+        return AssignedReviewers.objects.filter(
+            reviewer=record, role=self.verbose_name, submission__status__in=active_statuses
+        ).count()
+
+
+@method_decorator(staff_required, name='dispatch')
+class StaffAssignments(SingleTableMixin, ListView):
+    model = User
+    table_class = StaffAssignmentsTable
+    table_pagination = False
+    template_name = 'funds/staff_assignments.html'
+
+    def get_queryset(self):
+        # Only list staff.
+        return self.model.objects.staff()
+
+    def get_table_data(self):
+        table_data = super().get_table_data()
+        reviewer_roles = ReviewerRole.objects.all().order_by('order')
+        for data in table_data:
+            for i, role in enumerate(reviewer_roles):
+                # Only setting column name with dummy value 0.
+                # Actual value will be set in RoleColumn render method.
+                setattr(data, f'role{i}', 0)
+        return table_data
+
+    def get_table_kwargs(self):
+        reviewer_roles = ReviewerRole.objects.all().order_by('order')
+        extra_columns = []
+        for i, role in enumerate(reviewer_roles):
+            extra_columns.append((f'role{i}', RoleColumn(verbose_name=role)))
+        return {
+            'extra_columns': extra_columns,
+        }
